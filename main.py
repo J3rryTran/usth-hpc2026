@@ -1,6 +1,7 @@
 import sys
 from numba import cuda, float32
 import math
+from time import perf_counter
 
 import numpy as np
 import matplotlib.image as image
@@ -15,7 +16,14 @@ RS = R // 2
 KS = K // 2
 PAD = RS + KS
 H2 = H_PARAM * H_PARAM
-NORM = float(K * K * 3) 
+NORM = float32(K * K * 3)
+
+BS = 16
+TPB = (BS, BS)
+TILE = BS + 2 * PAD
+NTHREADS = BS * BS
+
+SMEM = TILE * TILE * 3 * 4 # share memory
 
 # Util
 def load_image(path):
@@ -56,9 +64,61 @@ def patch_distance2(src, iy, ix, jy, jx):
                 acc += diff * diff
     return acc / NORM
 
-
 @cuda.jit
 def nlm_kernel(src, dst):
+    x, y = cuda.grid(2)
+    if y >= dst.shape[0] or x >= dst.shape[1]:
+        return
+
+    iy = y + PAD
+    ix = x + PAD
+
+    acc_r = float32(0.0)
+    acc_g = float32(0.0)
+    acc_b = float32(0.0)
+    acc_w = float32(0.0)
+
+    for dy in range(-RS, RS + 1):
+        for dx in range(-RS, RS + 1):
+            jy = iy + dy
+            jx = ix + dx
+
+            d2 = patch_distance2(src, iy, ix, jy, jx)
+            w = weight(d2)
+
+            acc_r += w * src[jy, jx, 0]
+            acc_g += w * src[jy, jx, 1]
+            acc_b += w * src[jy, jx, 2]
+            acc_w += w
+
+    dst[y, x, 0] = acc_r / acc_w
+    dst[y, x, 1] = acc_g / acc_w
+    dst[y, x, 2] = acc_b / acc_w
+
+
+@cuda.jit
+def nlm_kernel_sm(src, dst):
+
+    tile = cuda.shared.array((TILE, TILE, 3), dtype=float32)
+
+    tx = cuda.threadIdx.x
+    ty = cuda.threadIdx.y
+    oy = cuda.blockIdx.y * BS
+    ox = cuda.blockIdx.x * BS
+
+    for sy in range(ty, TILE, BS):
+        gy = oy + sy
+        if gy >= src.shape[0]:
+            gy = src.shape[0] - 1
+        for sx in range(tx, TILE, BS):
+            gx = ox + sx
+            if gx >= src.shape[1]:
+                gx = src.shape[1] - 1
+            for c in range(3):
+                tile[sy, sx, c] = src[gy, gx, c]
+
+    cuda.syncthreads()
+
     x, y = cuda.grid(2)
     if y >= dst.shape[0] or x >= dst.shape[1]:
         return
@@ -98,6 +158,10 @@ if __name__ == '__main__':
     device=cuda.select_device(0)
     print(f"Select cuda: {device}")
 
+    print(f'R={R}  K={K}  h={H_PARAM}')
+    print(f'PAD={PAD}  TILE={TILE}x{TILE}  block={TPB}')
+    print(f'shared memory/block = {TILE * TILE * 3 * 4:,} B')
+
     Img = load_image(sys.argv[1])
     h,w,c = Img.shape
 
@@ -107,17 +171,37 @@ if __name__ == '__main__':
 
     d_src = cuda.to_device(padded)
     d_dst = cuda.device_array((h, w, 3), dtype=np.float32)
+    d_dst_sm = cuda.device_array((h, w, 3), dtype=np.float32)
 
     tpb = (16, 16)
     bpg = ((w + tpb[0] - 1) // tpb[0], (h + tpb[1] - 1) // tpb[1])
 
     nlm_kernel[bpg, tpb](d_src, d_dst)
+    nlm_kernel_sm[bpg, tpb](d_src, d_dst_sm)
     cuda.synchronize()
+
+    t0 = perf_counter()
+    nlm_kernel[bpg, tpb](d_src, d_dst)
+    cuda.synchronize()
+    t_global = perf_counter() - t0
+
+    t0 = perf_counter()
+    nlm_kernel_sm[bpg, tpb](d_src, d_dst_sm)
+    cuda.synchronize()
+    t_shared = perf_counter() - t0
+
     print(f'Denoised: grid={bpg} block={tpb}')
 
     out = d_dst.copy_to_host()
+    out_sm = d_dst_sm.copy_to_host()
     out = np.clip(out, 0, 255).astype(np.uint8)
     src_u8 = Img.astype(np.uint8)
+
+    print(f'no shared memory: {t_global * 1e3:8.1f} ms')
+    print(f'shared memory   : {t_shared * 1e3:8.1f} ms   '
+          f'tile={TILE}x{TILE}  {SMEM:,} B/block')
+    print(f'speedup         : {t_global / t_shared:8.2f}x')
+    print(f'max |diff| between the two outputs: {np.abs(out - out_sm).max():.3e}')
 
     fig, ax = plt.subplots(1, 2, figsize=(14, 7))
     ax[0].imshow(src_u8)
