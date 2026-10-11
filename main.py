@@ -213,4 +213,18 @@ if __name__ == '__main__':
     fig.tight_layout()
     fig.savefig('compare.jpg', dpi=120, bbox_inches='tight')
     plt.close(fig)
-    print('Wrote compare.jpg')
+
+    y0, x0, s = h // 3, w // 3, 120
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+    ax[0].imshow(src_u8[y0:y0 + s, x0:x0 + s])
+    ax[0].set_title(f'Input zoom images')
+    ax[1].imshow(out[y0:y0 + s, x0:x0 + s])
+    ax[1].set_title('NLM denoised')
+    for a in ax:
+        a.axis('off')
+    fig.tight_layout()
+    fig.savefig('compare_zoom.jpg', dpi=120, bbox_inches='tight')
+    plt.close(fig)
+
+    print('Wrote compare.jpg and compare_zoom.jpg')
